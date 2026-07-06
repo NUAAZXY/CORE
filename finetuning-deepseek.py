@@ -449,7 +449,9 @@ def main():
     model = LoRAModel(base_model)
 
     if args.gradient_checkpointing:
-        base_model.gradient_checkpointing_enable()
+        base_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

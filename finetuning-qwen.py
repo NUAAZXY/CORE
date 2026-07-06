@@ -465,7 +465,12 @@ def main():
     model = LoRAModel(base_model)
 
     if args.gradient_checkpointing:
-        base_model.gradient_checkpointing_enable()
+        # use_reentrant=False is required when only LoRA params require grad
+        # (base model params are frozen). The default use_reentrant=True only
+        # tracks gradients through input tensors, missing module-internal params.
+        base_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -497,49 +502,10 @@ def main():
     model.train()
     completed_steps = 0
 
-    # === DEBUG: single step diagnostics ===
-    if accelerator.is_main_process:
-        print("=" * 60)
-        print(f"[DEBUG] torch.is_grad_enabled() = {torch.is_grad_enabled()}")
-        print(f"[DEBUG] torch.is_inference_mode_enabled() = {torch.is_inference_mode_enabled()}")
-        trainable = [(n, p.shape, p.requires_grad) for n, p in model.named_parameters() if p.requires_grad]
-        print(f"[DEBUG] Trainable params count: {len(trainable)}")
-        for n, s, rg in trainable[:5]:
-            print(f"  {n}: shape={s}, requires_grad={rg}")
-        # Check if LinearWithLoRA modules exist
-        lora_modules = [(n, type(m).__name__) for n, m in model.named_modules() if isinstance(m, LinearWithLoRA)]
-        print(f"[DEBUG] LinearWithLoRA modules: {len(lora_modules)}")
-        if lora_modules:
-            print(f"  first: {lora_modules[0][0]}")
-        print("=" * 60)
-
     for step, batch in enumerate(tqdm(train_dataloader,
                                       total=args.max_train_steps,
                                       leave=False)):
-        # DEBUG: check grad state before forward
-        if step == 0 and accelerator.is_main_process:
-            print(f"[DEBUG step=0] grad_enabled={torch.is_grad_enabled()}")
-            print(f"[DEBUG step=0] inference_mode={torch.is_inference_mode_enabled()}")
-            print(f"[DEBUG step=0] batch.requires_grad={batch.requires_grad if hasattr(batch, 'requires_grad') else 'N/A'}")
-
         outputs = model(batch, labels=batch, use_cache=False)
-
-        # DEBUG: check outputs
-        if step == 0 and accelerator.is_main_process:
-            print(f"[DEBUG step=0] outputs.loss = {outputs.loss}")
-            print(f"[DEBUG step=0] outputs.loss.requires_grad = {outputs.loss.requires_grad}")
-            print(f"[DEBUG step=0] outputs.loss.grad_fn = {outputs.loss.grad_fn}")
-            print(f"[DEBUG step=0] outputs.logits.requires_grad = {outputs.logits.requires_grad}")
-            print(f"[DEBUG step=0] outputs.logits.grad_fn = {outputs.logits.grad_fn}")
-            # Try computing loss externally
-            logits = outputs.logits
-            shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
-            shift_labels = batch[..., 1:].contiguous().view(-1)
-            ext_loss = torch.nn.functional.cross_entropy(shift_logits, shift_labels)
-            print(f"[DEBUG step=0] external_loss = {ext_loss}")
-            print(f"[DEBUG step=0] external_loss.requires_grad = {ext_loss.requires_grad}")
-            print(f"[DEBUG step=0] external_loss.grad_fn = {ext_loss.grad_fn}")
-
         loss = outputs.loss
         loss = loss / args.gradient_accumulation_steps
         print(loss)
