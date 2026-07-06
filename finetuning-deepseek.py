@@ -43,6 +43,20 @@ class LoRALayer(nn.Module):
         return result
 
 
+def _patch_linear_with_lora(linear_module, lora_layer):
+    """Monkey-patch a Linear module's forward to include LoRA output.
+    This works regardless of whether the caller uses module(x) or F.linear()."""
+    original_forward = linear_module.forward
+
+    def patched_forward(x):
+        result = original_forward(x)
+        return result + lora_layer(x)
+
+    linear_module.forward = patched_forward
+    linear_module._lora_layer = lora_layer
+    linear_module._original_forward = original_forward
+
+
 def inject_lora_to_model(model, target_layers_start=0, rank=32, target_modules=['o_proj', 'v_proj']):
     # Freeze ALL parameters
     logging.info("Freezing all model parameters...")
@@ -72,6 +86,7 @@ def inject_lora_to_model(model, target_layers_start=0, rank=32, target_modules=[
                         rank=rank
                     )
                     lora_layers[name] = lora_layer
+                    _patch_linear_with_lora(module, lora_layer)
                     logging.info(f"Injected LoRA into {name} (layer {layer_idx}, in={module.in_features}, out={module.out_features})")
 
     if len(lora_layers) == 0:
@@ -97,27 +112,7 @@ class LoRAModel(nn.Module):
         self.config = base_model.config
 
     def forward(self, input_ids, labels=None, use_cache=False, **kwargs):
-        handles = []
-
-        def create_lora_hook(lora_layer, original_module):
-            def hook(module, input, output):
-                lora_output = lora_layer(input[0])
-                return output + lora_output
-            return hook
-
-        for name, lora_layer in self.lora_layers.items():
-            parts = name.split('.')
-            module = self.base_model
-            for part in parts:
-                module = getattr(module, part)
-            handle = module.register_forward_hook(create_lora_hook(lora_layer, module))
-            handles.append(handle)
-
         outputs = self.base_model(input_ids, labels=labels, use_cache=use_cache, **kwargs)
-
-        for handle in handles:
-            handle.remove()
-
         return outputs
 
     def merge_lora_weights(self):
@@ -133,6 +128,8 @@ class LoRAModel(nn.Module):
                 lora_weight = (lora_B @ lora_A) * lora_layer.scaling
                 with torch.no_grad():
                     module.weight.data += lora_weight
+                if hasattr(module, '_original_forward'):
+                    module.forward = module._original_forward
                 logging.info(f"Merged LoRA weights for {name}")
         logging.info("LoRA merge complete!")
 
