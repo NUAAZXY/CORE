@@ -19,58 +19,35 @@ import transformers
 os.environ['CUDA_VISIBLE_DEVICES'] = '1,2,3,4'
 
 
-# LoRA via module replacement - replaces nn.Linear with a custom module
-# that stores the frozen weight as a buffer and LoRA params as trainable parameters.
-# Works regardless of how the model accesses the weight (module(x), F.linear, etc.)
-import torch.nn.functional as F_torch
+# LoRA via weight parametrization - memory efficient, works with use_reentrant=False
+from torch.nn.utils import parametrize
 
 
-class LinearWithLoRA(nn.Module):
-    """Drop-in replacement for nn.Linear that adds a LoRA low-rank update.
-    The original weight is stored as a frozen buffer. LoRA A/B are trainable.
-    Exposes .weight property so F.linear(x, module.weight) still works."""
-    def __init__(self, original_linear, rank=32, alpha=32):
+class LoRAParametrization(nn.Module):
+    """Adds a low-rank update to a weight matrix via torch parametrization.
+    Every time module.weight is accessed, it returns original_weight + B @ A * scaling."""
+    def __init__(self, in_features, out_features, rank=32, alpha=32):
         super().__init__()
-        self.in_features = original_linear.in_features
-        self.out_features = original_linear.out_features
-
-        # Store original weight as frozen buffer (not a parameter)
-        self.register_buffer('frozen_weight', original_linear.weight.data.clone())
-        if original_linear.bias is not None:
-            self.register_buffer('frozen_bias', original_linear.bias.data.clone())
-        else:
-            self.frozen_bias = None
-
-        # LoRA trainable parameters
-        self.lora_A = nn.Parameter(torch.zeros(rank, self.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
+        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
         self.scaling = alpha / rank
         nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
         nn.init.zeros_(self.lora_B)
 
-    @property
-    def weight(self):
-        """Returns frozen_weight + LoRA delta. Has grad_fn via lora_A/lora_B."""
-        lora_A = self.lora_A.to(self.frozen_weight.dtype)
-        lora_B = self.lora_B.to(self.frozen_weight.dtype)
-        return self.frozen_weight + (lora_B @ lora_A) * self.scaling
-
-    @property
-    def bias(self):
-        return self.frozen_bias
-
-    def forward(self, x):
-        return F_torch.linear(x, self.weight, self.frozen_bias)
+    def forward(self, weight):
+        lora_A = self.lora_A.to(weight.dtype)
+        lora_B = self.lora_B.to(weight.dtype)
+        return weight + (lora_B @ lora_A) * self.scaling
 
 
 def inject_lora_to_model(model, target_layers_start=0, rank=32, alpha=32, target_modules=['o_proj', 'v_proj']):
-    # Freeze ALL parameters first
+    # Freeze ALL parameters
     logging.info("Freezing all model parameters...")
     for param in model.parameters():
         param.requires_grad = False
 
-    # Collect replacements (don't modify while iterating)
-    replacements = []
+    lora_count = 0
+
     for name, module in model.named_modules():
         if 'layers' in name and isinstance(module, nn.Linear):
             parts = name.split('.')
@@ -86,28 +63,25 @@ def inject_lora_to_model(model, target_layers_start=0, rank=32, alpha=32, target
             if layer_idx >= target_layers_start:
                 module_name = parts[-1] if len(parts) > 0 else ''
                 if module_name in target_modules:
-                    replacements.append((name, parts, module))
+                    lora_param = LoRAParametrization(
+                        in_features=module.in_features,
+                        out_features=module.out_features,
+                        rank=rank,
+                        alpha=alpha
+                    )
+                    parametrize.register_parametrization(module, "weight", lora_param)
+                    lora_count += 1
+                    logging.info(f"Injected LoRA into {name} (layer {layer_idx}, in={module.in_features}, out={module.out_features})")
 
-    if len(replacements) == 0:
+    if lora_count == 0:
         logging.warning("No LoRA layers were injected! Check model structure and target_modules names.")
         logging.info("Available module names in model:")
         for name, module in model.named_modules():
             if 'layers' in name and isinstance(module, nn.Linear):
                 logging.info(f"  {name}")
-        return model, 0
 
-    # Apply replacements
-    for name, parts, original_module in replacements:
-        lora_module = LinearWithLoRA(original_module, rank=rank, alpha=alpha)
-        # Navigate to parent and replace the child module
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        setattr(parent, parts[-1], lora_module)
-        logging.info(f"Replaced {name} with LinearWithLoRA (rank={rank}, in={original_module.in_features}, out={original_module.out_features})")
-
-    logging.info(f"Total LoRA modules added: {len(replacements)}")
-    return model, len(replacements)
+    logging.info(f"Total LoRA modules added: {lora_count}")
+    return model, lora_count
 
 
 class LoRAModel(nn.Module):
@@ -121,36 +95,12 @@ class LoRAModel(nn.Module):
         return outputs
 
     def merge_lora_weights(self):
-        """Merge LoRA into frozen weights and replace LinearWithLoRA back to nn.Linear."""
+        """Merge LoRA weights into base model by removing parametrizations."""
         logging.info("Merging LoRA weights into base model...")
-        replacements = []
         for name, module in self.base_model.named_modules():
-            if isinstance(module, LinearWithLoRA):
-                replacements.append((name, module))
-
-        for name, module in replacements:
-            # Create a standard nn.Linear with merged weights
-            merged_linear = nn.Linear(
-                module.in_features, module.out_features,
-                bias=(module.frozen_bias is not None),
-                dtype=module.frozen_weight.dtype,
-                device=module.frozen_weight.device
-            )
-            with torch.no_grad():
-                lora_A = module.lora_A.to(module.frozen_weight.dtype)
-                lora_B = module.lora_B.to(module.frozen_weight.dtype)
-                merged_linear.weight.copy_(module.frozen_weight + (lora_B @ lora_A) * module.scaling)
-                if module.frozen_bias is not None:
-                    merged_linear.bias.copy_(module.frozen_bias)
-
-            # Replace in parent
-            parts = name.split('.')
-            parent = self.base_model
-            for part in parts[:-1]:
-                parent = getattr(parent, part)
-            setattr(parent, parts[-1], merged_linear)
-            logging.info(f"Merged LoRA weights for {name}")
-
+            if parametrize.is_parametrized(module, "weight"):
+                parametrize.remove_parametrizations(module, "weight", leave_parametrized=True)
+                logging.info(f"Merged LoRA weights for {name}")
         logging.info("LoRA merge complete!")
 
     def save_pretrained(self, save_path, merge_lora=True, **kwargs):
