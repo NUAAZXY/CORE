@@ -19,42 +19,26 @@ import transformers
 os.environ['CUDA_VISIBLE_DEVICES'] = '1,2,3,4'
 
 
-# LoRA Implementation
-class LoRALayer(nn.Module):
-    def __init__(self, in_features, out_features, rank=32, alpha=32, dropout=0.0):
-        super().__init__()
-        self.rank = rank
-        self.alpha = alpha
-        self.scaling = alpha / rank
+# LoRA via weight parametrization - works even when model uses F.linear(x, module.weight)
+from torch.nn.utils import parametrize
 
-        # LoRA matrices
+
+class LoRAParametrization(nn.Module):
+    """Adds a low-rank update to a weight matrix via torch parametrization.
+    Every time module.weight is accessed, it returns original_weight + B @ A * scaling."""
+    def __init__(self, in_features, out_features, rank=32, alpha=32):
+        super().__init__()
         self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
         self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        # Initialize LoRA weights
+        self.scaling = alpha / rank
         nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
         nn.init.zeros_(self.lora_B)
 
-    def forward(self, x):
-        lora_A = self.lora_A.to(x.dtype)
-        lora_B = self.lora_B.to(x.dtype)
-        result = self.dropout(x) @ lora_A.T @ lora_B.T * self.scaling
-        return result
-
-
-def _patch_linear_with_lora(linear_module, lora_layer):
-    """Monkey-patch a Linear module's forward to include LoRA output.
-    This works regardless of whether the caller uses module(x) or F.linear()."""
-    original_forward = linear_module.forward
-
-    def patched_forward(x):
-        result = original_forward(x)
-        return result + lora_layer(x)
-
-    linear_module.forward = patched_forward
-    linear_module._lora_layer = lora_layer
-    linear_module._original_forward = original_forward
+    def forward(self, weight):
+        # weight: (out_features, in_features) - the original frozen weight
+        lora_A = self.lora_A.to(weight.dtype)
+        lora_B = self.lora_B.to(weight.dtype)
+        return weight + (lora_B @ lora_A) * self.scaling
 
 
 def inject_lora_to_model(model, target_layers_start=0, rank=32, target_modules=['o_proj', 'v_proj']):
@@ -63,7 +47,7 @@ def inject_lora_to_model(model, target_layers_start=0, rank=32, target_modules=[
     for param in model.parameters():
         param.requires_grad = False
 
-    lora_layers = {}
+    lora_count = 0
 
     for name, module in model.named_modules():
         if 'layers' in name and isinstance(module, nn.Linear):
@@ -80,60 +64,43 @@ def inject_lora_to_model(model, target_layers_start=0, rank=32, target_modules=[
             if layer_idx >= target_layers_start:
                 module_name = parts[-1] if len(parts) > 0 else ''
                 if module_name in target_modules:
-                    lora_layer = LoRALayer(
+                    lora_param = LoRAParametrization(
                         in_features=module.in_features,
                         out_features=module.out_features,
                         rank=rank
                     )
-                    lora_layers[name] = lora_layer
-                    # Patch the Linear's forward directly instead of relying on hooks
-                    _patch_linear_with_lora(module, lora_layer)
+                    parametrize.register_parametrization(module, "weight", lora_param)
+                    lora_count += 1
                     logging.info(f"Injected LoRA into {name} (layer {layer_idx}, in={module.in_features}, out={module.out_features})")
 
-    if len(lora_layers) == 0:
+    if lora_count == 0:
         logging.warning("No LoRA layers were injected! Check model structure and target_modules names.")
         logging.info("Available module names in model:")
         for name, module in model.named_modules():
             if 'layers' in name and isinstance(module, nn.Linear):
                 logging.info(f"  {name}")
 
-    for name, lora_layer in lora_layers.items():
-        param_name = name.replace('.', '_') + '_lora'
-        model.add_module(param_name, lora_layer)
-
-    logging.info(f"Total LoRA modules added: {len(lora_layers)}")
-    return model, lora_layers
+    logging.info(f"Total LoRA modules added: {lora_count}")
+    return model, lora_count
 
 
 class LoRAModel(nn.Module):
-    def __init__(self, base_model, lora_layers):
+    def __init__(self, base_model):
         super().__init__()
         self.base_model = base_model
-        self.lora_layers = lora_layers
         self.config = base_model.config
 
     def forward(self, input_ids, labels=None, use_cache=False, **kwargs):
-        # LoRA is applied via patched forward methods on Linear modules,
-        # no hooks needed
         outputs = self.base_model(input_ids, labels=labels, use_cache=use_cache, **kwargs)
         return outputs
 
     def merge_lora_weights(self):
+        """Merge LoRA weights into base model by removing parametrizations."""
         logging.info("Merging LoRA weights into base model...")
-        for name, lora_layer in self.lora_layers.items():
-            parts = name.split('.')
-            module = self.base_model
-            for part in parts:
-                module = getattr(module, part)
-            if isinstance(module, nn.Linear):
-                lora_A = lora_layer.lora_A.to(module.weight.dtype)
-                lora_B = lora_layer.lora_B.to(module.weight.dtype)
-                lora_weight = (lora_B @ lora_A) * lora_layer.scaling
-                with torch.no_grad():
-                    module.weight.data += lora_weight
-                # Restore original forward after merging
-                if hasattr(module, '_original_forward'):
-                    module.forward = module._original_forward
+        for name, module in self.base_model.named_modules():
+            if parametrize.is_parametrized(module, "weight"):
+                # leave_parametrized=True: keeps the current (original + LoRA) weight
+                parametrize.remove_parametrizations(module, "weight", leave_parametrized=True)
                 logging.info(f"Merged LoRA weights for {name}")
         logging.info("LoRA merge complete!")
 
@@ -143,29 +110,11 @@ class LoRAModel(nn.Module):
 
         if merge_lora:
             self.merge_lora_weights()
-            self.base_model.save_pretrained(
-                save_path,
-                save_function=kwargs.get('save_function', torch.save)
-            )
-            logging.info(f"Saved merged model to {save_path}")
-        else:
-            lora_state_dict = {}
-            for name, lora_layer in self.lora_layers.items():
-                lora_state_dict[name] = {
-                    'lora_A': lora_layer.lora_A.data,
-                    'lora_B': lora_layer.lora_B.data,
-                    'rank': lora_layer.rank,
-                    'alpha': lora_layer.alpha
-                }
-            torch.save(lora_state_dict, save_path / 'lora_weights.pt')
-            config = {
-                'lora_rank': 16,
-                'lora_alpha': 16,
-                'target_modules': ['o_proj', 'v_proj', 'q_proj', 'k_proj'],
-                'target_layers_start': 0
-            }
-            torch.save(config, save_path / 'lora_config.pt')
-            logging.info(f"Saved LoRA weights to {save_path}")
+        self.base_model.save_pretrained(
+            save_path,
+            save_function=kwargs.get('save_function', torch.save)
+        )
+        logging.info(f"Saved model to {save_path}")
 
 
 class ConstantLengthDataset(IterableDataset):
@@ -408,8 +357,8 @@ def parse_args():
     parser.add_argument("--max_eval_steps", type=int, default=0, help="Maximum evaluation steps")
 
     # Data parameters
-    parser.add_argument("--train_dataset", type=str, default="starcoder_20Btokens", help="Training dataset path")
-    parser.add_argument("--valid_dataset", type=str, default="datasets/starcoder_20Btokens_val", help="Validation dataset path")
+    parser.add_argument("--train_dataset", type=str, default="../starcoder_20Btokens", help="Training dataset path")
+    parser.add_argument("--valid_dataset", type=str, default="../datasets/starcoder_20Btokens_val", help="Validation dataset path")
     parser.add_argument("--seq_length", type=int, default=1024, help="Sequence length")
     parser.add_argument("--extrapolate_length", type=int, default=8192, help="Extrapolation length")
 
@@ -456,14 +405,14 @@ def main():
 
     # Qwen2.5-Coder-7B: 28 layers, attention uses q_proj/k_proj/v_proj/o_proj
     logger.info(f"Injecting LoRA (rank={args.lora_rank}) into layers >= {args.lora_target_layers_start}")
-    base_model, lora_layers = inject_lora_to_model(
+    base_model, lora_count = inject_lora_to_model(
         base_model,
         target_layers_start=args.lora_target_layers_start,
         rank=args.lora_rank,
         target_modules=['o_proj', 'v_proj', 'q_proj', 'k_proj']
     )
 
-    model = LoRAModel(base_model, lora_layers)
+    model = LoRAModel(base_model)
 
     if args.gradient_checkpointing:
         base_model.gradient_checkpointing_enable()
