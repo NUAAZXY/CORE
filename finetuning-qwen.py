@@ -315,12 +315,13 @@ def evaluate(model, eval_dataloader, accelerator, args):
     losses = []
     count = 0
     correct = 0
+    vocab_size = accelerator.unwrap_model(model).config.vocab_size
 
     for step, batch in enumerate(eval_dataloader):
         with torch.no_grad():
             outputs = model(batch, labels=batch, use_cache=False)
 
-        logits = outputs.logits[:, :-1].contiguous().view(-1, model.config.vocab_size)
+        logits = outputs.logits[:, :-1].contiguous().view(-1, vocab_size)
         labels = batch[:, 1:].contiguous().view(-1).to(logits.device)
         pred = torch.argmax(logits, dim=-1)
         correct += (pred.squeeze() == labels).tolist().count(True)
@@ -339,8 +340,9 @@ def evaluate(model, eval_dataloader, accelerator, args):
     return loss.item(), perplexity.item(), correct / count
 
 
-def evaluate_extrapolation(model, eval_extrapolation_dataloader, args):
+def evaluate_extrapolation(model, eval_extrapolation_dataloader, accelerator, args):
     model.eval()
+    vocab_size = accelerator.unwrap_model(model).config.vocab_size
     losses = [0, 0, 0, 0]
     counts = [0, 0, 0, 0]
     corrects = [0, 0, 0, 0]
@@ -351,7 +353,7 @@ def evaluate_extrapolation(model, eval_extrapolation_dataloader, args):
             outputs = model(batch, labels=batch, use_cache=False)
 
         for i in range(len(val_len) - 1):
-            logits = outputs.logits[:, val_len[i]:val_len[i + 1] - 1].contiguous().view(-1, model.config.vocab_size)
+            logits = outputs.logits[:, val_len[i]:val_len[i + 1] - 1].contiguous().view(-1, vocab_size)
             labels = batch[:, val_len[i] + 1: val_len[i + 1]].contiguous().view(-1).to(logits.device)
             pred = torch.argmax(logits, dim=-1)
             corrects[i] += (pred.squeeze() == labels).tolist().count(True)
