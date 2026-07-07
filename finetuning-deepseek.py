@@ -92,6 +92,7 @@ class LoRAModel(nn.Module):
         return outputs
 
     def merge_lora_weights(self):
+        """Permanently merge LoRA weights. Only use for final save."""
         logging.info("Merging LoRA weights into base model...")
         for name, module in self.base_model.named_modules():
             if parametrize.is_parametrized(module, "weight"):
@@ -99,16 +100,38 @@ class LoRAModel(nn.Module):
                 logging.info(f"Merged LoRA weights for {name}")
         logging.info("LoRA merge complete!")
 
-    def save_pretrained(self, save_path, merge_lora=True, **kwargs):
+    def save_pretrained(self, save_path, merge_lora=True, destructive=False, **kwargs):
         save_path = Path(save_path)
         save_path.mkdir(parents=True, exist_ok=True)
+        save_function = kwargs.get('save_function', torch.save)
 
-        if merge_lora:
+        if merge_lora and destructive:
             self.merge_lora_weights()
-        self.base_model.save_pretrained(
-            save_path,
-            save_function=kwargs.get('save_function', torch.save)
-        )
+            self.base_model.save_pretrained(save_path, save_function=save_function)
+        elif merge_lora:
+            # Intermediate save: temporarily remove parametrizations, save, then restore
+            param_info = []
+            for name, module in self.base_model.named_modules():
+                if parametrize.is_parametrized(module, "weight"):
+                    merged_weight = module.weight.detach().clone()
+                    param_list = list(module.parametrizations.weight)
+                    param_info.append((module, name, param_list, merged_weight))
+
+            for module, name, param_list, merged_weight in param_info:
+                parametrize.remove_parametrizations(module, "weight", leave_parametrized=True)
+
+            self.base_model.save_pretrained(save_path, save_function=save_function)
+
+            for module, name, param_list, merged_weight in param_info:
+                for lora_param in param_list:
+                    lora_A = lora_param.lora_A.to(merged_weight.dtype)
+                    lora_B = lora_param.lora_B.to(merged_weight.dtype)
+                    original_weight = merged_weight - (lora_B @ lora_A) * lora_param.scaling
+                    module.weight = nn.Parameter(original_weight, requires_grad=False)
+                    parametrize.register_parametrization(module, "weight", lora_param)
+        else:
+            self.base_model.save_pretrained(save_path, save_function=save_function)
+
         logging.info(f"Saved model to {save_path}")
 
 
@@ -476,7 +499,7 @@ def main():
             unwrapped_model = accelerator.unwrap_model(model)
             save_path = output_dir / f"checkpoint_{step}"
             merge_lora = not args.save_lora_only
-            unwrapped_model.save_pretrained(save_path, merge_lora=merge_lora, save_function=accelerator.save)
+            unwrapped_model.save_pretrained(save_path, merge_lora=merge_lora, destructive=False, save_function=accelerator.save)
 
             if accelerator.is_main_process:
                 tokenizer.save_pretrained(save_path)
@@ -492,7 +515,7 @@ def main():
     unwrapped_model = accelerator.unwrap_model(model)
     final_save_path = output_dir / f"final_checkpoint_{step}"
     merge_lora = not args.save_lora_only
-    unwrapped_model.save_pretrained(final_save_path, merge_lora=merge_lora, save_function=accelerator.save)
+    unwrapped_model.save_pretrained(final_save_path, merge_lora=merge_lora, destructive=True, save_function=accelerator.save)
     if accelerator.is_main_process:
         tokenizer.save_pretrained(final_save_path)
 
