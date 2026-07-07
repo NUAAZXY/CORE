@@ -16,7 +16,7 @@ from datasets import load_dataset, load_from_disk
 from accelerate import Accelerator
 import datasets
 import transformers
-os.environ['CUDA_VISIBLE_DEVICES'] = '1,2,3,4'
+# CUDA_VISIBLE_DEVICES should be set in the launch shell script, not here
 
 
 # LoRA via weight parametrization - memory efficient, works with use_reentrant=False
@@ -361,7 +361,8 @@ def evaluate_extrapolation(model, eval_extrapolation_dataloader, args):
         if args.max_eval_steps > 0 and step >= args.max_eval_steps:
             break
 
-    losses = [l / step for l in losses]
+    num_steps = max(step, 1)
+    losses = [l / num_steps for l in losses]
     try:
         perplexity = [torch.exp(loss) for loss in losses]
     except OverflowError:
@@ -498,7 +499,6 @@ def main():
         outputs = model(batch, labels=batch, use_cache=False)
         loss = outputs.loss
         loss = loss / args.gradient_accumulation_steps
-        print(loss)
         accelerator.backward(loss)
 
         if step % args.gradient_accumulation_steps == 0:
@@ -508,14 +508,26 @@ def main():
             optimizer.zero_grad()
             completed_steps += 1
 
+        if step % args.log_step == 0 and step > 0:
+            log_metrics(accelerator, logger, tb_writer, step, {
+                'lr': get_lr(),
+                'loss/train': loss.item(),
+                'steps': completed_steps,
+            }, args.use_wandb)
+
         if step % args.save_checkpoint_steps == 0 and step > 0:
             logger.info('Evaluating and saving model checkpoint')
+
+            eval_loss, eval_ppl, eval_acc = evaluate(model, eval_dataloader, accelerator, args)
 
             metrics = {
                 'lr': get_lr(),
                 'samples': step * samples_per_step,
                 'steps': completed_steps,
                 'loss/train': loss.item(),
+                'loss/eval': eval_loss,
+                'perplexity/eval': eval_ppl,
+                'accuracy/eval': eval_acc,
             }
 
             log_metrics(accelerator, logger, tb_writer, step, metrics, args.use_wandb)
@@ -524,11 +536,10 @@ def main():
             unwrapped_model = accelerator.unwrap_model(model)
             save_path = output_dir / f"checkpoint_{step}"
             merge_lora = not args.save_lora_only
-            unwrapped_model.save_pretrained(save_path, merge_lora=merge_lora, destructive=False, save_function=accelerator.save)
-
-            # Also save tokenizer alongside checkpoint
             if accelerator.is_main_process:
+                unwrapped_model.save_pretrained(save_path, merge_lora=merge_lora, destructive=False, save_function=accelerator.save)
                 tokenizer.save_pretrained(save_path)
+            accelerator.wait_for_everyone()
 
             model.train()
 
@@ -537,13 +548,17 @@ def main():
 
     # Save final checkpoint
     logger.info('Evaluating and saving final model checkpoint')
+    eval_loss, eval_ppl, eval_acc = evaluate(model, eval_dataloader, accelerator, args)
+    logger.info(f"Final eval - loss: {eval_loss:.4f}, ppl: {eval_ppl:.4f}, acc: {eval_acc:.4f}")
+
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
     final_save_path = output_dir / f"final_checkpoint_{step}"
     merge_lora = not args.save_lora_only
-    unwrapped_model.save_pretrained(final_save_path, merge_lora=merge_lora, destructive=True, save_function=accelerator.save)
     if accelerator.is_main_process:
+        unwrapped_model.save_pretrained(final_save_path, merge_lora=merge_lora, destructive=True, save_function=accelerator.save)
         tokenizer.save_pretrained(final_save_path)
+    accelerator.wait_for_everyone()
 
     if accelerator.is_main_process and tb_writer:
         tb_writer.close()
