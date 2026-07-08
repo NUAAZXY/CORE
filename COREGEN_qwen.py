@@ -443,6 +443,9 @@ class Qwen2Attention(nn.Module):
         self.top_k_act = [1, 2, 8]
         self.register_buffer("m", get_alibi_slope(self.num_heads))
 
+        # _use_block_mask is set by Qwen2Model based on model.use_block_mask
+        self._use_block_mask = True
+
         if self.layer_idx == self.masking_layer[0]:
             self.dependency_encoding = DependencyEncoding(
                 self.hidden_size, sum(self.activation_groups),
@@ -500,78 +503,82 @@ class Qwen2Attention(nn.Module):
                         past_key_value.lde = pos_embeddings[:, -2].unsqueeze(-2)
                     else:
                         past_key_value.lde = pos_embeddings[:, -1].unsqueeze(-2)
-                feature_splits = outputs['features_split']
-                block_att_masks = outputs['block_att_masks']
-                block_masks = []
-                for dim, (feature_split, block_att_mask) in enumerate(zip(feature_splits, block_att_masks)):
-                    feature_split_seq = torch.zeros_like(hidden_states)
-                    b_mask = torch.zeros(bsz, self.num_heads, q_len, q_len, device=hidden_states.device, dtype=bool)
-                    for i in range(bsz):
-                        valid_indices = line_positions[i][mask[i]]
-                        feature_split_seq[i, valid_indices[0]:] = feature_split_seq[i,
-                                                                  valid_indices[0]:] + feature_split[i,
-                                                                                       :len(valid_indices)].repeat_interleave(
-                            repeat_indices[i], dim=0)
-                        b_mask[i, :, valid_indices[0]:, valid_indices[0]:] = b_mask[i, :, valid_indices[0]:,
-                                                                             valid_indices[0]:] + block_att_mask[i,
-                                                                                                  :len(valid_indices)].repeat_interleave(
-                            repeat_indices[i], dim=0).repeat_interleave(repeat_indices[i], dim=1)
-                    feature_q = self.q_proj(feature_split_seq)
-                    feature_k = self.k_proj(feature_split_seq)
-                    feature_q = feature_q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-                    feature_k = feature_k.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-                    feature_k = repeat_kv(feature_k, self.num_key_value_groups)
-                    if past_key_value is not None:
-                        feature_q, feature_k = past_key_value.update_de(feature_q, feature_k, dim,
-                                                                        self.activation_groups)
-                    d_score = torch.matmul(feature_q, feature_k.transpose(2, 3))
 
-                    causal_mask_de = torch.triu(torch.ones(q_len, q_len, dtype=torch.bool, device=d_score.device),
-                                                diagonal=1)
-                    d_score = d_score + attention_mask[1][:, :, :, :q_len]
-                    if past_key_value is not None:
-                        final_mask = dynamic_topk_attention(d_score, training_length=1024, max_k=900,
-                                                           is_prefilling=q_len != 1)
-                    else:
-                        final_mask = dynamic_topk_attention(d_score, training_length=1024, max_k=900,
-                                                           is_prefilling=q_len != 1)
-                    if past_key_value is not None and q_len == 1 and past_key_value.tokens[0].tolist()[-1] == 13:
-                        b_mask = torch.zeros(bsz, 1, 1, past_key_value.tokens.size(-1), dtype=bool, device='cuda')
-                        b_mask[:, :, :,
-                        -past_key_value.find_position_difference(past_key_value.f[dim].size(-2)):] = True
-                    final_mask = torch.logical_and(final_mask, ~b_mask)
-                    final_mask = torch.logical_or(final_mask, causal_mask_de)
-                    block_masks.append(final_mask)
-                block_mask = torch.any(torch.stack(block_masks), dim=0)
-                block_mask = block_mask.float()
-                block_mask[block_mask.bool()] = torch.finfo(hidden_states.dtype).min
-                if q_len == 1 and use_cache:
-                    lbm = past_key_value.lbm
-                    new_mask = torch.zeros(bsz, self.num_heads, lbm.size(-1) + 1, lbm.size(-1) + 1,
-                                           dtype=block_mask.dtype, device=block_mask.device)
-                    new_mask[:, :, lbm.size(-1), :lbm.size(-1)] = lbm[:, :, lbm.size(-1) - 1, :lbm.size(-1)]
-                    new_mask[:, :, :lbm.size(-1), lbm.size(-1)] = lbm[:, :, :lbm.size(-1), lbm.size(-1) - 1]
-                    new_mask[:, :, -1] = block_mask[:, :, 0, :]
-                    new_mask += attention_mask[1]
-                    block_mask = new_mask
-                    past_key_value.lbm = block_mask
-                if use_cache:
-                    past_key_value.lbm = block_mask
+                # Block mask construction (only when use_block_mask=True, i.e. Stage 2)
+                if self._use_block_mask:
+                    feature_splits = outputs['features_split']
+                    block_att_masks = outputs['block_att_masks']
+                    block_masks = []
+                    for dim, (feature_split, block_att_mask) in enumerate(zip(feature_splits, block_att_masks)):
+                        feature_split_seq = torch.zeros_like(hidden_states)
+                        b_mask = torch.zeros(bsz, self.num_heads, q_len, q_len, device=hidden_states.device, dtype=bool)
+                        for i in range(bsz):
+                            valid_indices = line_positions[i][mask[i]]
+                            feature_split_seq[i, valid_indices[0]:] = feature_split_seq[i,
+                                                                      valid_indices[0]:] + feature_split[i,
+                                                                                           :len(valid_indices)].repeat_interleave(
+                                repeat_indices[i], dim=0)
+                            b_mask[i, :, valid_indices[0]:, valid_indices[0]:] = b_mask[i, :, valid_indices[0]:,
+                                                                                 valid_indices[0]:] + block_att_mask[i,
+                                                                                                      :len(valid_indices)].repeat_interleave(
+                                repeat_indices[i], dim=0).repeat_interleave(repeat_indices[i], dim=1)
+                        feature_q = self.q_proj(feature_split_seq)
+                        feature_k = self.k_proj(feature_split_seq)
+                        feature_q = feature_q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+                        feature_k = feature_k.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                        feature_k = repeat_kv(feature_k, self.num_key_value_groups)
+                        if past_key_value is not None:
+                            feature_q, feature_k = past_key_value.update_de(feature_q, feature_k, dim,
+                                                                            self.activation_groups)
+                        d_score = torch.matmul(feature_q, feature_k.transpose(2, 3))
+
+                        causal_mask_de = torch.triu(torch.ones(q_len, q_len, dtype=torch.bool, device=d_score.device),
+                                                    diagonal=1)
+                        d_score = d_score + attention_mask[1][:, :, :, :q_len]
+                        if past_key_value is not None:
+                            final_mask = dynamic_topk_attention(d_score, training_length=1024, max_k=900,
+                                                               is_prefilling=q_len != 1)
+                        else:
+                            final_mask = dynamic_topk_attention(d_score, training_length=1024, max_k=900,
+                                                               is_prefilling=q_len != 1)
+                        if past_key_value is not None and q_len == 1 and past_key_value.tokens[0].tolist()[-1] == 13:
+                            b_mask = torch.zeros(bsz, 1, 1, past_key_value.tokens.size(-1), dtype=bool, device='cuda')
+                            b_mask[:, :, :,
+                            -past_key_value.find_position_difference(past_key_value.f[dim].size(-2)):] = True
+                        final_mask = torch.logical_and(final_mask, ~b_mask)
+                        final_mask = torch.logical_or(final_mask, causal_mask_de)
+                        block_masks.append(final_mask)
+                    block_mask = torch.any(torch.stack(block_masks), dim=0)
+                    block_mask = block_mask.float()
+                    block_mask[block_mask.bool()] = torch.finfo(hidden_states.dtype).min
+                    if q_len == 1 and use_cache:
+                        lbm = past_key_value.lbm
+                        new_mask = torch.zeros(bsz, self.num_heads, lbm.size(-1) + 1, lbm.size(-1) + 1,
+                                               dtype=block_mask.dtype, device=block_mask.device)
+                        new_mask[:, :, lbm.size(-1), :lbm.size(-1)] = lbm[:, :, lbm.size(-1) - 1, :lbm.size(-1)]
+                        new_mask[:, :, :lbm.size(-1), lbm.size(-1)] = lbm[:, :, :lbm.size(-1), lbm.size(-1) - 1]
+                        new_mask[:, :, -1] = block_mask[:, :, 0, :]
+                        new_mask += attention_mask[1]
+                        block_mask = new_mask
+                        past_key_value.lbm = block_mask
+                    if use_cache:
+                        past_key_value.lbm = block_mask
             elif q_len == 1 and past_key_value.tokens[0].tolist()[-1] != 13:
                 position_embeddings = past_key_value.lde
-                for dim in range(len(self.activation_groups)):
-                    _, feature_k = past_key_value.update_de(None, past_key_value.de_k[dim][:, :, -1,].unsqueeze(-2),
-                                                            dim, self.activation_groups)
-                block_mask = past_key_value.lbm
-                new_mask = torch.zeros(bsz, self.num_heads, block_mask.size(-1) + 1, block_mask.size(-1) + 1,
-                                       dtype=block_mask.dtype, device=block_mask.device)
-                new_mask[:, :, block_mask.size(-1), :block_mask.size(-1)] = block_mask[:, :, block_mask.size(-1) - 1,
-                                                                            :block_mask.size(-1)]
-                new_mask[:, :, :block_mask.size(-1), block_mask.size(-1)] = block_mask[:, :, :block_mask.size(-1),
-                                                                            block_mask.size(-1) - 1]
-                new_mask += attention_mask[1]
-                past_key_value.lbm = new_mask
-                block_mask = new_mask
+                if self._use_block_mask:
+                    for dim in range(len(self.activation_groups)):
+                        _, feature_k = past_key_value.update_de(None, past_key_value.de_k[dim][:, :, -1,].unsqueeze(-2),
+                                                                dim, self.activation_groups)
+                    block_mask = past_key_value.lbm
+                    new_mask = torch.zeros(bsz, self.num_heads, block_mask.size(-1) + 1, block_mask.size(-1) + 1,
+                                           dtype=block_mask.dtype, device=block_mask.device)
+                    new_mask[:, :, block_mask.size(-1), :block_mask.size(-1)] = block_mask[:, :, block_mask.size(-1) - 1,
+                                                                                :block_mask.size(-1)]
+                    new_mask[:, :, :block_mask.size(-1), block_mask.size(-1)] = block_mask[:, :, :block_mask.size(-1),
+                                                                                block_mask.size(-1) - 1]
+                    new_mask += attention_mask[1]
+                    past_key_value.lbm = new_mask
+                    block_mask = new_mask
 
         # Add dependency encoding to hidden states for masking layers
         if self.layer_idx in self.masking_layer and position_embeddings is not None:
@@ -772,6 +779,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self._attn_implementation = config._attn_implementation
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
+        # Stage 1: use_block_mask=False (train DE only, no mask)
+        # Stage 2: use_block_mask=True  (LoRA finetuning with mask)
+        self.use_block_mask = True
         self.post_init()
 
     def get_input_embeddings(self):
@@ -941,6 +951,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         position_ids = [position_ids, position_ids_]
 
         position_embeddings = None
+
+        # Propagate use_block_mask flag to attention layers
+        for layer in self.layers:
+            layer.self_attn._use_block_mask = self.use_block_mask
 
         # Decoder layers
         all_hidden_states = () if output_hidden_states else None
