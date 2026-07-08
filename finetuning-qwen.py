@@ -10,8 +10,9 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import wandb
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoConfig
 from transformers import AdamW, get_scheduler, set_seed
+from COREGEN_qwen import Qwen2ForCausalLM as COREGENQwen2ForCausalLM
 from datasets import load_dataset, load_from_disk
 from accelerate import Accelerator
 import datasets
@@ -45,6 +46,19 @@ def inject_lora_to_model(model, target_layers_start=0, rank=32, alpha=32, target
     logging.info("Freezing all model parameters...")
     for param in model.parameters():
         param.requires_grad = False
+
+    # Unfreeze DependencyEncoding parameters (these are randomly initialized, must be trained)
+    de_param_count = 0
+    for name, module in model.named_modules():
+        if 'DependencyEncoding' in type(module).__name__:
+            for param_name, param in module.named_parameters():
+                param.requires_grad = True
+                de_param_count += param.numel()
+                logging.info(f"Unfroze DependencyEncoding parameter: {name}.{param_name}, shape: {param.shape}")
+    if de_param_count > 0:
+        logging.info(f"Total DependencyEncoding parameters unfrozen: {de_param_count:,}")
+    else:
+        logging.warning("No DependencyEncoding parameters found to unfreeze!")
 
     lora_count = 0
 
@@ -377,11 +391,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Finetune Qwen2.5-Coder-7B with LoRA")
 
     # Model parameters
-    parser.add_argument("--model_name", type=str, default=os.path.expanduser("~/models/Qwen2.5-Coder-7B-Instruct"), help="Base model path")
+    parser.add_argument("--model_name", type=str, default=os.path.expanduser("~/models/Qwen2.5-Coder-7B"), help="Base model path")
 
     # LoRA parameters
-    parser.add_argument("--lora_rank", type=int, default=64, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=64, help="LoRA alpha")
+    parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout")
     parser.add_argument("--lora_target_layers_start", type=int, default=0, help="Starting layer for LoRA")
     parser.add_argument("--merge_lora_on_save", action="store_true", help="Merge LoRA weights when saving", default=True)
@@ -437,11 +451,10 @@ def main():
     # Load Qwen tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
 
-    # Load Qwen2.5-Coder-7B model
-    base_model = AutoModelForCausalLM.from_pretrained(
+    # Load Qwen2.5-Coder-7B with COREGEN (DependencyEncoding integrated)
+    base_model = COREGENQwen2ForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
         attn_implementation='eager',
     )
 
