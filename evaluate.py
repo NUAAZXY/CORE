@@ -332,50 +332,66 @@ def run_metrics(args):
     else:
         input_list = ["lcc", "repobench-p"]
 
-    total_points = 0
-    total_em, total_es, total_cb = 0, 0, 0
-
+    # Separate data into rounds: same idx appearing again = next round
+    # Round 1 = first occurrence, Round 2 = second occurrence, etc.
+    # First pass: collect all data and detect number of rounds
+    all_level_rounds = {}  # level -> {idx -> [entry_r1, entry_r2, ...]}
+    global_num_rounds = 1
     for level in input_list:
         filepath = os.path.join(path, f"{level}.jsonl")
         if not os.path.exists(filepath):
-            print(f"  {level}: not found, skipping")
             continue
-
-        seen_indices = set()
-        data = []
+        rounds = {}
         with open(filepath, "r") as f:
             for line in f:
                 entry = json.loads(line.strip())
                 idx = entry["idx"]
-                if idx not in seen_indices:
-                    seen_indices.add(idx)
-                    data.append(entry)
+                if idx not in rounds:
+                    rounds[idx] = []
+                rounds[idx].append(entry)
+        if rounds:
+            all_level_rounds[level] = rounds
+            global_num_rounds = max(global_num_rounds, max(len(v) for v in rounds.values()))
 
-        if not data:
-            continue
+    # Compute and print metrics per round
+    for r in range(global_num_rounds):
+        if global_num_rounds > 1:
+            print(f"\n--- Round {r+1} ---")
+        total_points = 0
+        total_em, total_es, total_cb = 0, 0, 0
 
-        ground_truth = [d["gt"] for d in data]
-        generated = [d["pred"] for d in data]
+        for level in input_list:
+            if level not in all_level_rounds:
+                print(f"  {level}: not found, skipping")
+                continue
+            rounds = all_level_rounds[level]
+            data = []
+            for idx in sorted(rounds.keys()):
+                if r < len(rounds[idx]):
+                    data.append(rounds[idx][r])
+            if not data:
+                continue
 
-        em = round(exact_match_score(ground_truth, generated) * 100, 2)
-        es = round(edit_similarity_score(ground_truth, generated), 2)
-        cb = round(codebleu_score(generated, ground_truth, args.language) * 100, 2)
+            ground_truth = [d["gt"] for d in data]
+            generated = [d["pred"] for d in data]
 
-        n = len(data)
-        total_points += n
-        total_em += em * n
-        total_es += es * n
-        total_cb += cb * n
+            em = round(exact_match_score(ground_truth, generated) * 100, 2)
+            es = round(edit_similarity_score(ground_truth, generated), 2)
+            cb = round(codebleu_score(generated, ground_truth, args.language) * 100, 2)
 
-        print(f"  {level} ({n} samples): EM={em}, ES={es}, CB={cb}")
+            n = len(data)
+            total_points += n
+            total_em += em * n
+            total_es += es * n
+            total_cb += cb * n
 
-    if total_points > 0:
-        print(f"\n  Weighted Average ({total_points} total):")
-        print(f"    EM={round(total_em/total_points, 2)}, "
-              f"ES={round(total_es/total_points, 2)}, "
-              f"CB={round(total_cb/total_points, 2)}")
-    else:
-        print("No data points found.")
+            print(f"  {level} ({n} samples): EM={em}, ES={es}, CB={cb}")
+
+        if total_points > 0:
+            print(f"  Weighted Average ({total_points} total): "
+                  f"EM={round(total_em/total_points, 2)}, "
+                  f"ES={round(total_es/total_points, 2)}, "
+                  f"CB={round(total_cb/total_points, 2)}")
 
 
 # ============================================================
